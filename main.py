@@ -145,10 +145,8 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="rolecounts",
-                  description="Show top users who pinged a specific role")
-@app_commands.describe(role="Select a role to view stats for")
-async def rolecounts(interaction: discord.Interaction, role: discord.Role):
+async def _show_role_counts(interaction: discord.Interaction, role: discord.Role):
+    """Helper function to show role count statistics."""
     top_users = get_top_for_role(interaction.guild.id, role.id)
     if not top_users:
         await interaction.response.send_message(
@@ -167,9 +165,17 @@ async def rolecounts(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="rolecounts",
+                  description="Show top users who pinged a specific role")
+@app_commands.describe(role="Select a role to view stats for")
+async def rolecounts(interaction: discord.Interaction, role: discord.Role):
+    await _show_role_counts(interaction, role)
+
+
 @bot.tree.command(name="leaderboard", description="Alias for /rolecounts")
+@app_commands.describe(role="Select a role to view stats for")
 async def leaderboard(interaction: discord.Interaction, role: discord.Role):
-    await rolecounts(interaction, role)
+    await _show_role_counts(interaction, role)
 
 
 @bot.tree.command(name="mycounts", description="Show your personal ping stats")
