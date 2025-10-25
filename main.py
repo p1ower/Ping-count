@@ -4,13 +4,15 @@
 # pip install -U discord.py
 
 import discord
-from discord import app_commands
+from discord import MemberFlags, app_commands
 from discord.ext import commands
 import csv
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import Counter, defaultdict
+from discord.ext import tasks
 
+CLEANUP_DAYS = 30  # default: remove entries older than 30 days
 TOKEN = os.environ['PING_COUNT_TOKEN']  # <-- hier Token eintragen
 CSV_PATH = "role_pings.csv"
 
@@ -18,6 +20,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+
+
+@tasks.loop(hours=24)
+async def daily_cleanup():
+    cleanup_old_entries()
+
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -72,6 +80,41 @@ def write_all_pings(rows):
         writer.writerows(rows)
 
 
+def cleanup_old_entries(days: int = CLEANUP_DAYS):
+    """Remove entries older than the given number of days from the CSV."""
+    if not os.path.exists(CSV_PATH):
+        return
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    kept_rows = []
+    removed = 0
+
+    with open(CSV_PATH, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                ts = datetime.fromisoformat(row["timestamp"])
+                if ts >= cutoff:
+                    kept_rows.append(row)
+                else:
+                    removed += 1
+            except Exception:
+                # Skip malformed timestamps
+                continue
+
+    # Rewrite file
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f,
+                                fieldnames=[
+                                    "guild_id", "role_id", "user_id",
+                                    "channel_id", "timestamp"
+                                ])
+        writer.writeheader()
+        writer.writerows(kept_rows)
+
+    print(f" Cleaned up {removed} old entries (> {days} days old)")
+
+
 # ---------- Datenabfragen ----------
 def get_top_for_role(guild_id, role_id, limit=10):
     rows = read_all_pings()
@@ -112,13 +155,17 @@ def reset_user_counts(guild_id, user_id):
 # ---------- Events ----------
 @bot.event
 async def on_ready():
+    '''Syncs the slash commands and prints a ready message.'''
     ensure_csv_exists()
+    cleanup_old_entries()  # <-- automatic cleanup on startup
+    daily_cleanup.start()
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user} — Slash Commands synced.")
 
 
 @bot.event
 async def on_message(message: discord.Message):
+    '''Adds a ping to the CSV if a role is mentioned.'''
     if message.author.bot or not message.guild:
         return
 
@@ -136,6 +183,7 @@ async def on_message(message: discord.Message):
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="📘 Role Ping Counter — Help",
                           color=discord.Color.blurple())
+    '''Show the available commands.'''
     embed.description = (
         "/rolecounts @Role — Show top users who pinged that role.\n"
         "/leaderboard @Role — Alias for /rolecounts.\n"
@@ -145,7 +193,8 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-async def _show_role_counts(interaction: discord.Interaction, role: discord.Role):
+async def _show_role_counts(interaction: discord.Interaction,
+                            role: discord.Role):
     """Helper function to show role count statistics."""
     top_users = get_top_for_role(interaction.guild.id, role.id)
     if not top_users:
@@ -169,18 +218,74 @@ async def _show_role_counts(interaction: discord.Interaction, role: discord.Role
                   description="Show top users who pinged a specific role")
 @app_commands.describe(role="Select a role to view stats for")
 async def rolecounts(interaction: discord.Interaction, role: discord.Role):
+    '''Show the top users who pinged a specific role.'''
     await _show_role_counts(interaction, role)
 
 
 @bot.tree.command(name="leaderboard", description="Alias for /rolecounts")
-@app_commands.describe(role="Select a role to view stats for")
-async def leaderboard(interaction: discord.Interaction, role: discord.Role):
-    await _show_role_counts(interaction, role)
+@app_commands.describe(role="Select a role to view stats for (optional)")
+async def leaderboard(interaction: discord.Interaction,
+                      role: discord.Role | None = None):
+    '''Alias for /rolecounts. Shows the top users who pinged a specific role.'''
+    if role is None:
+        rows = read_all_pings()
+        guild_rows = [
+            r for r in rows if r["guild_id"] == str(interaction.guild.id)
+        ]
+        if not guild_rows:
+            await interaction.response.send_message(
+                "No data found for this server yet.", ephemeral=True)
+            #print(f"No data found for guild {interaction.guild.id}")
+            return
+        else:
+            #print(f"Found {len(guild_rows)} rows for guild {interaction.guild.id}")
+
+            # Rollen gruppieren
+            grouped = defaultdict(Counter)
+            for r in guild_rows:
+                grouped[r["role_id"]][r["user_id"]] += 1
+
+            #print(f"Grouped: {grouped}")
+            # Ergebnisse nach Gesamtpings der Rolle sortieren
+            sorted_roles = sorted(grouped.items(),
+                                  key=lambda x: sum(x[1].values()),
+                                  reverse=True)
+            #print(f"Sorted roles: {sorted_roles}")
+
+            # Wir bauen einen Embed mit den Top-Rollen
+            embed = discord.Embed(title=f"🌍 Server Leaderboard — All Roles",
+                                  color=discord.Color.gold(),
+                                  description="")
+
+            max_roles = 5  # z. B. nur die Top 5 Rollen anzeigen
+            for idx, (role_id, counter) in enumerate(sorted_roles[:max_roles],
+                                                     start=1):
+                role = interaction.guild.get_role(int(role_id))
+                if role is None:
+                    continue  # überspringe gelöschte Rollen
+
+                total_pings = sum(counter.values())
+                top_users = counter.most_common(3)
+                user_lines = []
+                for user_id, count in top_users:
+                    member = interaction.guild.get_member(int(user_id))
+                    name = member.display_name if member else f"<User {user_id}>"
+                    user_lines.append(f"• **{count}x**: *{name}*")
+
+                embed.add_field(
+                    name=f"{idx}. {role.name} — {total_pings} total pings",
+                    value="\n".join(user_lines),
+                    inline=False)
+
+            await interaction.response.send_message(embed=embed)
+    else:
+        await _show_role_counts(interaction, role)
 
 
 @bot.tree.command(name="mycounts", description="Show your personal ping stats")
 async def mycounts(interaction: discord.Interaction):
     counts = get_counts_for_user(interaction.guild.id, interaction.user.id)
+    '''Show the user's personal role ping statistics. Each user can only view their own stats.'''
     if not counts:
         await interaction.response.send_message(
             "You haven't pinged any roles yet.", ephemeral=True)
@@ -201,9 +306,11 @@ async def mycounts(interaction: discord.Interaction):
 
 @bot.tree.command(name="resetcounts",
                   description="Reset all counts for a role (Admin only)")
-@app_commands.checks.has_permissions(manage_guild=True)
+#@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(administrator=True)
 async def resetcounts(interaction: discord.Interaction, role: discord.Role):
     reset_role_counts(interaction.guild.id, role.id)
+    '''Reset the counts for a specific role. Only admins can use this command.'''
     await interaction.response.send_message(
         f"✅ Counts for {role.mention} have been reset.", ephemeral=True)
 
@@ -212,8 +319,22 @@ async def resetcounts(interaction: discord.Interaction, role: discord.Role):
                   description="Reset your personal counts")
 async def resetmycounts(interaction: discord.Interaction):
     reset_user_counts(interaction.guild.id, interaction.user.id)
+    '''Reset the user's personal counts. Each user can only reset their own counts.'''
     await interaction.response.send_message("✅ Your counts have been reset.",
                                             ephemeral=True)
+
+
+@bot.tree.command(name="cleanup",
+                  description="Clean up old ping records (Admin only)")
+@app_commands.describe(
+    days="Delete entries older than this many days (default 30)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def cleanup(interaction: discord.Interaction, days: int | None = None):
+    days = days or CLEANUP_DAYS
+    cleanup_old_entries(days)
+    await interaction.response.send_message(
+        f"🧹 Cleaned CSV, removed entries older than {days} days.",
+        ephemeral=True)
 
 
 # ---------- Run ----------
