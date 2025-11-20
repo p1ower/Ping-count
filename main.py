@@ -15,6 +15,9 @@ import json
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
+import matplotlib.pyplot as plt
+import io
+
 # Configuration
 CLEANUP_DAYS = 30  # Remove entries older than this many days
 TOKEN = os.environ['PING_COUNT_TOKEN']
@@ -110,10 +113,14 @@ def record_reaction(guild_id, message_id, user_id, emoji):
     data = load_reaction_stats(guild_id)
 
     data["reactions"].append({
-        "message_id": str(message_id),
-        "user_id": str(user_id),
-        "emoji": emoji,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "message_id":
+        str(message_id),
+        "user_id":
+        str(user_id),
+        "emoji":
+        emoji,
+        "timestamp":
+        datetime.now(timezone.utc).isoformat()
     })
 
     save_reaction_stats(guild_id, data)
@@ -619,86 +626,151 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     print(f"[SpoilerTracker] {user} reacted with {reaction.emoji} "
           f"to spoiler message {message.id} in {guild.name}")
 
+
+# ========== ping_timeline Commands ==========
+
+
+@bot.tree.command(
+    name="timeline",
+    description="Zeigt einen Zeitverlaufsgraphen der Role-Pings.")
+@app_commands.describe(
+    role="Optional: Zeigt nur die Timeline für diese Rolle.")
+async def timeline(interaction: discord.Interaction,
+                   role: discord.Role = None):
+    await interaction.response.defer()
+
+    guild_id = interaction.guild.id
+    csv_file = f"ping_data_{guild_id}.csv"
+
+    if not os.path.exists(csv_file):
+        return await interaction.followup.send(
+            "Noch keine Ping-Daten vorhanden.")
+
+    # --- CSV einlesen ---
+    timestamps = defaultdict(int)
+    role_id_filter = str(role.id) if role else None
+
+    with open(csv_file, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # nur dieses Guild
+            if str(row["guild_id"]) != str(guild_id):
+                continue
+
+            # Optional Rolle filtern
+            if role_id_filter and row["role_id"] != role_id_filter:
+                continue
+
+            ts = datetime.fromisoformat(row["timestamp"])
+            day = ts.date()
+            timestamps[day] += 1
+
+    if not timestamps:
+        return await interaction.followup.send(
+            "Keine passenden Ping-Daten gefunden.")
+
+    # --- Daten nach Datum sortieren ---
+    days = sorted(timestamps.keys())
+    counts = [timestamps[d] for d in days]
+
+    # --- Graph erstellen ---
+    plt.figure(figsize=(10, 4))
+    plt.plot(days, counts, marker="o")
+    plt.xlabel("Datum")
+    plt.ylabel("Anzahl der Roll-Pings")
+    plt.title(f"Ping-Verlauf{' für ' + role.name if role else ''}")
+    plt.grid(True)
+    plt.tight_layout()
+
+    # Bild in Bytes speichern
+    buffer = io.BytesIO()
+    plt.savefig(buffer, format="png")
+    buffer.seek(0)
+    plt.close()
+
+    # --- Graph senden ---
+    file = File(buffer, filename="ping_timeline.png")
+    await interaction.followup.send(file=file)
+
+
+# ========== Reaction Commands ==========
+
+
 @bot.tree.command(name="reactionstats",
-      description="Zeigt Reaction-Leaderboard")
+                  description="Zeigt Reaction-Leaderboard")
 async def reactionstats(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
 
     stats = load_reaction_stats(guild_id)
     reactions = stats["reactions"]
-    
+
     if not reactions:
         return await interaction.response.send_message(
-        "Keine Reaktionen gespeichert.", ephemeral=True)
-    
+            "Keine Reaktionen gespeichert.", ephemeral=True)
+
     # Counts total - User Ranking
     counter = Counter()
     for r in reactions:
         counter[r["user_id"]] += 1
-    
+
     top10 = counter.most_common(10)
-    
-    embed = discord.Embed(
-        title="📸 Spoiler Reaction Leaderboard (Top 10)",
-        color=discord.Color.purple()
-    )
-    
+
+    embed = discord.Embed(title="📸 Spoiler Reaction Leaderboard (Top 10)",
+                          color=discord.Color.purple())
+
     # ===== Top 10 User =====
     lines = []
     for user_id, count in top10:
         member = interaction.guild.get_member(int(user_id))
         name = member.display_name if member else f"<User {user_id}>"
         lines.append(f"**{count}x** — {name}")
-    
+
     embed.description = "\n".join(lines)
-    
+
     # ===== ACCUMULATED ROLE RANKING =====
     config = load_reaction_config(guild_id)
     rank_roles = config.get("rank_roles", [])
-    
+
     if rank_roles:
         # Lua Style Divider
         embed.add_field(name="— — — — —", value=" ", inline=False)
-    
+
         # (1) Count reactions per user
         user_reaction_count = Counter()
         for r in reactions:
             user_reaction_count[r["user_id"]] += 1
-    
+
         # (2) Prepare role totals
         role_totals = {rid: 0 for rid in rank_roles}
-        
+
         # (3) Add reactions per user to all roles they have
         for user_id, count in user_reaction_count.items():
             member = interaction.guild.get_member(int(user_id))
             if not member:
                 continue
-            
+
             for rid in rank_roles:
                 role = interaction.guild.get_role(int(rid))
                 if role and role in member.roles:
                     role_totals[rid] += count
-        
+
         # (4) Sort roles by total reactions
-        sorted_roles = sorted(
-        role_totals.items(),
-        key=lambda x: x[1],
-        reverse=True
-        )
-        
+        sorted_roles = sorted(role_totals.items(),
+                              key=lambda x: x[1],
+                              reverse=True)
+
         # (5) Show accumulated ranking
         for rid, total in sorted_roles:
             role = interaction.guild.get_role(int(rid))
             if role is None:
                 continue
-    
-            embed.add_field(
-                name=f"🎭 {role.name}",
-                value=f"**{total} Reaktionen** insgesamt",
-                inline=False
-            )
+
+            embed.add_field(name=f"🎭 {role.name}",
+                            value=f"**{total} Reaktionen** insgesamt",
+                            inline=False)
 
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="reaction_set_roles",
                   description="Setze Ranking-Rollen.")
