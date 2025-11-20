@@ -12,7 +12,7 @@ from discord.ext import commands, tasks
 import csv
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
 # Configuration
@@ -66,7 +66,7 @@ def append_spoiler_reaction_json(guild_id, message_id, user_id, emoji):
         "message_id": str(message_id),
         "user_id": str(user_id),
         "emoji": str(emoji),
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
     data["reactions"].append(entry)
@@ -113,7 +113,7 @@ def record_reaction(guild_id, message_id, user_id, emoji):
         "message_id": str(message_id),
         "user_id": str(user_id),
         "emoji": emoji,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
     save_reaction_stats(guild_id, data)
@@ -193,7 +193,7 @@ def append_ping(guild_id, role_id, user_id, channel_id):
             writer = csv.writer(f)
             writer.writerow([
                 guild_id, role_id, user_id, channel_id,
-                datetime.utcnow().isoformat()
+                datetime.now(timezone.utc).isoformat()
             ])
     except Exception as e:
         print(f"Error appending ping: {e}")
@@ -239,7 +239,8 @@ def cleanup_old_entries(days: int = CLEANUP_DAYS):
     if not os.path.exists(CSV_PATH):
         return
 
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
     kept_rows = []
     removed = 0
 
@@ -753,7 +754,7 @@ async def reaction_cleanup(interaction: discord.Interaction, days: int = 30):
     guild_id = str(interaction.guild.id)
     stats = load_reaction_stats(guild_id)
 
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     before = len(stats["reactions"])
     stats["reactions"] = [
