@@ -18,12 +18,14 @@ from collections import Counter, defaultdict
 CLEANUP_DAYS = 30  # Remove entries older than this many days
 TOKEN = os.environ['PING_COUNT_TOKEN']
 CSV_PATH = "role_pings.csv"
+REACTION_CSV_PATH = "spoiler_reactions.csv"
 
 # Configure bot intents (permissions for what the bot can see/do)
 intents = discord.Intents.default()
 intents.message_content = True  # Required to read message content
-intents.guilds = True           # Required to access guild information
-intents.members = True          # Required to get member information
+intents.guilds = True  # Required to access guild information
+intents.members = True  # Required to get member information
+
 
 # Daily cleanup task - runs every 24 hours
 @tasks.loop(hours=24)
@@ -31,11 +33,41 @@ async def daily_cleanup():
     """Automatically clean up old entries every 24 hours."""
     cleanup_old_entries()
 
+
 # Initialize the bot
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ========== Spoiler Reaction CSV Management ==========
+
+
+def ensure_reaction_csv_exists():
+    """Create CSV file for spoiler reactions."""
+    if not os.path.exists(REACTION_CSV_PATH):
+        with open(REACTION_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ["guild_id", "message_id", "user_id", "emoji", "timestamp"])
+
+
+def append_spoiler_reaction(guild_id, message_id, user_id, emoji):
+    """Log a reaction to a tracked spoiler image."""
+    ensure_reaction_csv_exists()
+    with open(REACTION_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            guild_id, message_id, user_id, emoji,
+            datetime.utcnow().isoformat()
+        ])
+
+
+def read_all_reactions():
+    ensure_reaction_csv_exists()
+    with open(REACTION_CSV_PATH, "r", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
 
 # ========== CSV File Management ==========
+
 
 def ensure_csv_exists():
     """Create the CSV file with headers if it doesn't exist."""
@@ -147,6 +179,7 @@ def cleanup_old_entries(days: int = CLEANUP_DAYS):
 
 # ========== Data Query Functions ==========
 
+
 def get_top_for_role(guild_id, role_id, limit=10):
     """
     Get the top users who pinged a specific role.
@@ -220,6 +253,7 @@ def reset_user_counts(guild_id, user_id):
 
 # ========== Bot Events ==========
 
+
 @bot.event
 async def on_ready():
     """Called when the bot successfully connects to Discord."""
@@ -227,7 +261,12 @@ async def on_ready():
     cleanup_old_entries()  # Clean up old entries on startup
     daily_cleanup.start()  # Start the daily cleanup task
     await bot.tree.sync()  # Sync slash commands with Discord
-    print(f"✅ Logged in as {bot.user} — Slash Commands synced.")
+
+    # Loop through all servers (guilds) the bot is connected to
+    for guild in bot.guilds:
+        print(
+            f"✅ Logged in as {bot.user} on {guild.name} — Slash Commands synced."
+        )
 
 
 @bot.event
@@ -244,38 +283,56 @@ async def on_message(message: discord.Message):
     for role in message.role_mentions:
         # Only track mentionable (pingable) roles
         if not role.mentionable:
+            #print(f"Skipping unmentionable role: {role.name}")
             continue
-        
+
         # Record the ping
-        append_ping(
-            guild_id=message.guild.id,
-            role_id=role.id,
-            user_id=message.author.id,
-            channel_id=message.channel.id
+        append_ping(guild_id=message.guild.id,
+                    role_id=role.id,
+                    user_id=message.author.id,
+                    channel_id=message.channel.id)
+    # === Spoiler Image Detection =====================================
+    is_spoiler = False
+
+    # Case 1: Attachments with "SPOILER_" prefix
+    for attachment in message.attachments:
+        if attachment.filename.startswith("SPOILER_"):
+            is_spoiler = True
+            break
+
+    # Case 2: Text spoiler formatting ||like this||
+    if "||" in message.content:
+        is_spoiler = True
+
+    # Mark message as spoiler-tracked
+    if is_spoiler:
+        # We only need to record the message_id,
+        # the reactions will populate the data later.
+        print(
+            f"[SpoilerTracker] Marked message {message.id} as spoiler content."
         )
 
 
 # ========== Slash Commands ==========
 
+
 @bot.tree.command(name="help", description="Show available commands")
 async def help_cmd(interaction: discord.Interaction):
     """Display a help message with all available commands."""
-    embed = discord.Embed(
-        title="📘 Role Ping Counter — Help",
-        color=discord.Color.blurple()
-    )
+    embed = discord.Embed(title="📘 Role Ping Counter — Help",
+                          color=discord.Color.blurple())
     embed.description = (
         "/rolecounts @Role — Show top users who pinged that role.\n"
         "/leaderboard @Role — Show leaderboard for a role (or all roles if none specified).\n"
         "/mycounts — Show your personal role ping stats.\n"
         "/resetcounts @Role — Reset counts for that role (Admin only).\n"
         "/resetmycounts — Delete all your counts.\n"
-        "/cleanup [days] — Remove old ping records (Admin only).\n"
-    )
+        "/cleanup [days] — Remove old ping records (Admin only).\n")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-async def _show_role_counts(interaction: discord.Interaction, role: discord.Role):
+async def _show_role_counts(interaction: discord.Interaction,
+                            role: discord.Role):
     """
     Helper function to display role ping statistics.
     
@@ -296,15 +353,14 @@ async def _show_role_counts(interaction: discord.Interaction, role: discord.Role
         name = member.display_name if member else f"<User {user_id}>"
         lines.append(f"**{total}x** — {name}")
 
-    embed = discord.Embed(
-        title=f"🏆 Top Role Pingers — {role.name}",
-        color=discord.Color.blurple()
-    )
+    embed = discord.Embed(title=f"🏆 Top Role Pingers — {role.name}",
+                          color=discord.Color.blurple())
     embed.description = "\n".join(lines)
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="rolecounts", description="Show top users who pinged a specific role")
+@bot.tree.command(name="rolecounts",
+                  description="Show top users who pinged a specific role")
 @app_commands.describe(role="Select a role to view stats for")
 async def rolecounts(interaction: discord.Interaction, role: discord.Role):
     """Display the top users who have pinged a specific role."""
@@ -312,8 +368,12 @@ async def rolecounts(interaction: discord.Interaction, role: discord.Role):
 
 
 @bot.tree.command(name="leaderboard", description="Show role ping leaderboard")
-@app_commands.describe(role="Select a role to view stats for (optional - shows all roles if not specified)")
-async def leaderboard(interaction: discord.Interaction, role: discord.Role | None = None):
+@app_commands.describe(
+    role=
+    "Select a role to view stats for (optional - shows all roles if not specified)"
+)
+async def leaderboard(interaction: discord.Interaction,
+                      role: discord.Role | None = None):
     """
     Display role ping leaderboard.
     If no role is specified, shows overall server leaderboard with top roles.
@@ -324,7 +384,7 @@ async def leaderboard(interaction: discord.Interaction, role: discord.Role | Non
         guild_rows = [
             r for r in rows if r["guild_id"] == str(interaction.guild.id)
         ]
-        
+
         if not guild_rows:
             await interaction.response.send_message(
                 "No data found for this server yet.", ephemeral=True)
@@ -336,28 +396,25 @@ async def leaderboard(interaction: discord.Interaction, role: discord.Role | Non
             grouped[r["role_id"]][r["user_id"]] += 1
 
         # Sort roles by total ping count
-        sorted_roles = sorted(
-            grouped.items(),
-            key=lambda x: sum(x[1].values()),
-            reverse=True
-        )
+        sorted_roles = sorted(grouped.items(),
+                              key=lambda x: sum(x[1].values()),
+                              reverse=True)
 
         # Build embed with top roles
-        embed = discord.Embed(
-            title=f"🌍 Server Leaderboard — All Roles",
-            color=discord.Color.gold(),
-            description=""
-        )
+        embed = discord.Embed(title=f"🌍 Server Leaderboard — All Roles",
+                              color=discord.Color.gold(),
+                              description="")
 
         max_roles = 5  # Show top 5 roles
-        for idx, (role_id, counter) in enumerate(sorted_roles[:max_roles], start=1):
+        for idx, (role_id, counter) in enumerate(sorted_roles[:max_roles],
+                                                 start=1):
             role_obj = interaction.guild.get_role(int(role_id))
             if role_obj is None:
                 continue  # Skip deleted roles
 
             total_pings = sum(counter.values())
             top_users = counter.most_common(3)
-            
+
             # Format top users for this role
             user_lines = []
             for user_id, count in top_users:
@@ -368,8 +425,7 @@ async def leaderboard(interaction: discord.Interaction, role: discord.Role | Non
             embed.add_field(
                 name=f"{idx}. {role_obj.name} — {total_pings} total pings",
                 value="\n".join(user_lines),
-                inline=False
-            )
+                inline=False)
 
         await interaction.response.send_message(embed=embed)
     else:
@@ -381,7 +437,7 @@ async def leaderboard(interaction: discord.Interaction, role: discord.Role | Non
 async def mycounts(interaction: discord.Interaction):
     """Display the user's personal role ping statistics."""
     counts = get_counts_for_user(interaction.guild.id, interaction.user.id)
-    
+
     if not counts:
         await interaction.response.send_message(
             "You haven't pinged any roles yet.", ephemeral=True)
@@ -396,13 +452,13 @@ async def mycounts(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title=f"📊 Your Ping Stats — {interaction.user.display_name}",
-        color=discord.Color.green()
-    )
+        color=discord.Color.green())
     embed.description = "\n".join(lines)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="resetcounts", description="Reset all counts for a role (Admin only)")
+@bot.tree.command(name="resetcounts",
+                  description="Reset all counts for a role (Admin only)")
 @app_commands.describe(role="Select a role to reset counts for")
 @app_commands.checks.has_permissions(administrator=True)
 async def resetcounts(interaction: discord.Interaction, role: discord.Role):
@@ -412,16 +468,19 @@ async def resetcounts(interaction: discord.Interaction, role: discord.Role):
         f"✅ Counts for {role.mention} have been reset.", ephemeral=True)
 
 
-@bot.tree.command(name="resetmycounts", description="Reset your personal counts")
+@bot.tree.command(name="resetmycounts",
+                  description="Reset your personal counts")
 async def resetmycounts(interaction: discord.Interaction):
     """Reset the user's personal ping counts."""
     reset_user_counts(interaction.guild.id, interaction.user.id)
-    await interaction.response.send_message(
-        "✅ Your counts have been reset.", ephemeral=True)
+    await interaction.response.send_message("✅ Your counts have been reset.",
+                                            ephemeral=True)
 
 
-@bot.tree.command(name="cleanup", description="Clean up old ping records (Admin only)")
-@app_commands.describe(days="Delete entries older than this many days (default: 30)")
+@bot.tree.command(name="cleanup",
+                  description="Clean up old ping records (Admin only)")
+@app_commands.describe(
+    days="Delete entries older than this many days (default: 30)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def cleanup(interaction: discord.Interaction, days: int | None = None):
     """
@@ -433,6 +492,75 @@ async def cleanup(interaction: discord.Interaction, days: int | None = None):
     await interaction.response.send_message(
         f"🧹 Cleaned CSV, removed entries older than {days} days.",
         ephemeral=True)
+
+
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+    """
+    Tracks reactions on spoiler-image messages.
+    """
+    if user.bot:
+        return
+    message = reaction.message
+    guild = message.guild
+    if guild is None:
+        return  # Ignore DMs
+
+    # Only track if message *is* a spoiler
+    is_spoiler = False
+
+    # Spoiler attachments
+    for att in message.attachments:
+        if att.filename.startswith("SPOILER_"):
+            is_spoiler = True
+            break
+
+    # Spoiler text formatting
+    if "||" in message.content:
+        is_spoiler = True
+
+    if not is_spoiler:
+        return  # Not relevant
+
+    # Log the reaction
+    append_spoiler_reaction(guild_id=guild.id,
+                            message_id=message.id,
+                            user_id=user.id,
+                            emoji=str(reaction.emoji))
+
+    print(f"[SpoilerTracker] {user} reacted with {reaction.emoji} "
+          f"to spoiler message {message.id} in {guild.name}")
+
+
+@bot.tree.command(name="spoilerstats",
+                  description="Show spoiler reaction stats")
+async def spoilerstats(interaction: discord.Interaction):
+    rows = read_all_reactions()
+    guild_rows = [
+        r for r in rows if r["guild_id"] == str(interaction.guild.id)
+    ]
+
+    if not guild_rows:
+        await interaction.response.send_message(
+            "No spoiler reactions recorded yet.", ephemeral=True)
+        return
+
+    counter = Counter()
+    for r in guild_rows:
+        key = (r["user_id"], r["emoji"])
+        counter[key] += 1
+
+    # Build leaderboard lines
+    lines = []
+    for (user_id, emoji), count in counter.most_common(20):
+        member = interaction.guild.get_member(int(user_id))
+        name = member.display_name if member else f"<User {user_id}>"
+        lines.append(f"{emoji} **{count}x** — {name}")
+
+    embed = discord.Embed(title="📸 Spoiler Reaction Leaderboard",
+                          color=discord.Color.purple(),
+                          description="\n".join(lines))
+    await interaction.response.send_message(embed=embed)
 
 
 # ========== Run the Bot ==========
