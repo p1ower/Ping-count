@@ -19,7 +19,6 @@ from collections import Counter, defaultdict
 CLEANUP_DAYS = 30  # Remove entries older than this many days
 TOKEN = os.environ['PING_COUNT_TOKEN']
 CSV_PATH = "role_pings.csv"
-REACTION_CSV_PATH = "spoiler_reactions.csv"
 
 # Configure bot intents (permissions for what the bot can see/do)
 intents = discord.Intents.default()
@@ -38,33 +37,126 @@ async def daily_cleanup():
 # Initialize the bot
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ========== Spoiler Reaction CSV Management ==========
+# ========== Spoiler Reaction JSON Management ==========
 
 
-def ensure_reaction_csv_exists():
-    """Create CSV file for spoiler reactions."""
-    if not os.path.exists(REACTION_CSV_PATH):
-        with open(REACTION_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["guild_id", "message_id", "user_id", "emoji", "timestamp"])
+def _reaction_json_path(guild_id):
+    return f"data/reactions/stats/{guild_id}.json"
 
 
-def append_spoiler_reaction(guild_id, message_id, user_id, emoji):
-    """Log a reaction to a tracked spoiler image."""
-    ensure_reaction_csv_exists()
-    with open(REACTION_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            guild_id, message_id, user_id, emoji,
-            datetime.utcnow().isoformat()
-        ])
+def ensure_reaction_json_exists(guild_id):
+    """Make sure the JSON file exists for the guild."""
+    path = _reaction_json_path(guild_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"reactions": []}, f, indent=4)
 
 
-def read_all_reactions():
-    ensure_reaction_csv_exists()
-    with open(REACTION_CSV_PATH, "r", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+def append_spoiler_reaction_json(guild_id, message_id, user_id, emoji):
+    """Save a spoiler reaction into <guild>.json"""
+    ensure_reaction_json_exists(guild_id)
+    path = _reaction_json_path(guild_id)
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    entry = {
+        "message_id": str(message_id),
+        "user_id": str(user_id),
+        "emoji": str(emoji),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+    data["reactions"].append(entry)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+
+def read_reaction_json(guild_id):
+    """Read <guild>.json reactions."""
+    ensure_reaction_json_exists(guild_id)
+    path = _reaction_json_path(guild_id)
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)["reactions"]
+
+
+def reaction_stats_path(guild_id):
+    return f"data/reactions/stats/{guild_id}.json"
+
+
+def load_reaction_stats(guild_id):
+    path = reaction_stats_path(guild_id)
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"reactions": []}, f)
+        return {"reactions": []}
+
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_reaction_stats(guild_id, data):
+    path = reaction_stats_path(guild_id)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4)
+
+
+def record_reaction(guild_id, message_id, user_id, emoji):
+    data = load_reaction_stats(guild_id)
+
+    data["reactions"].append({
+        "message_id": str(message_id),
+        "user_id": str(user_id),
+        "emoji": emoji,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    save_reaction_stats(guild_id, data)
+
+
+def load_reaction_config(guild_id):
+    path = f"data/reactions/configs/{guild_id}.json"
+    if not os.path.exists(path):
+        return {"rank_roles": []}
+    return json.load(open(path))
+
+
+async def build_role_ranking(guild, reaction_stats, reaction_config):
+    # hole die rollen, die für dieses guild konfiguriert sind
+    role_ids = reaction_config.get(str(guild.id), [])
+
+    # vorbereiten
+    role_totals = {role_id: 0 for role_id in role_ids}
+
+    # Schritt 1: User → Reaktionsanzahl
+    user_reaction_count = {}
+
+    for entry in reaction_stats["reactions"]:
+        uid = entry["user_id"]
+        user_reaction_count[uid] = user_reaction_count.get(uid, 0) + 1
+
+    # Schritt 2: Für jeden User prüfen, welche der konfigurierten Rollen er hat
+    for user_id, reaction_count in user_reaction_count.items():
+        member = guild.get_member(int(user_id))
+        if not member:
+            continue
+
+        for role_id in role_ids:
+            role = guild.get_role(int(role_id))
+            if role and role in member.roles:
+                role_totals[str(role_id)] += reaction_count
+
+    # sortieren nach Reaktionen
+    sorted_roles = sorted(role_totals.items(),
+                          key=lambda x: x[1],
+                          reverse=True)
+
+    return sorted_roles
 
 
 # ========== CSV File Management ==========
@@ -259,7 +351,8 @@ def reset_user_counts(guild_id, user_id):
 async def on_ready():
     """Called when the bot successfully connects to Discord."""
     ensure_csv_exists()
-    ensure_reaction_csv_exists()
+    for guild in bot.guilds:
+        ensure_reaction_json_exists(guild.id)
     cleanup_old_entries()  # Clean up old entries on startup
     daily_cleanup.start()  # Start the daily cleanup task
     await bot.tree.sync()  # Sync slash commands with Discord
@@ -498,73 +591,113 @@ async def cleanup(interaction: discord.Interaction, days: int | None = None):
 
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
-    """
-    Tracks reactions on spoiler-image messages.
-    """
     if user.bot:
         return
+
     print(f"[SpoilerTracker] Reaction added: {reaction.emoji} by {user}")
     message = reaction.message
     guild = message.guild
     if guild is None:
-        return  # Ignore DMs
+        return
 
-    # Only track if message *is* a spoiler
-    is_spoiler = False
-
-    # Spoiler attachments
-    for att in message.attachments:
-        if att.filename.startswith("SPOILER_"):
-            is_spoiler = True
-            break
-
-    # Spoiler text formatting
+    # Spoiler detection
+    is_spoiler = any(
+        att.filename.startswith("SPOILER_") for att in message.attachments)
     if "||" in message.content:
         is_spoiler = True
 
     if not is_spoiler:
-        return  # Not relevant
+        return
 
-    # Log the reaction
-    append_spoiler_reaction(guild_id=guild.id,
-                            message_id=message.id,
-                            user_id=user.id,
-                            emoji=str(reaction.emoji))
+    # Log entry in JSON
+    record_reaction(guild_id=guild.id,
+                    message_id=message.id,
+                    user_id=user.id,
+                    emoji=str(reaction.emoji))
 
     print(f"[SpoilerTracker] {user} reacted with {reaction.emoji} "
           f"to spoiler message {message.id} in {guild.name}")
 
+@bot.tree.command(name="reactionstats",
+      description="Zeigt Reaction-Leaderboard")
+async def reactionstats(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
 
-@bot.tree.command(name="spoilerstats",
-                  description="Show spoiler reaction stats")
-async def spoilerstats(interaction: discord.Interaction):
-    rows = read_all_reactions()
-    guild_rows = [
-        r for r in rows if r["guild_id"] == str(interaction.guild.id)
-    ]
-
-    if not guild_rows:
-        await interaction.response.send_message(
-            "No spoiler reactions recorded yet.", ephemeral=True)
-        return
-
+    stats = load_reaction_stats(guild_id)
+    reactions = stats["reactions"]
+    
+    if not reactions:
+        return await interaction.response.send_message(
+        "Keine Reaktionen gespeichert.", ephemeral=True)
+    
+    # Counts total - User Ranking
     counter = Counter()
-    for r in guild_rows:
-        key = (r["user_id"], r["emoji"])
-        counter[key] += 1
-
-    # Build leaderboard lines
+    for r in reactions:
+        counter[r["user_id"]] += 1
+    
+    top10 = counter.most_common(10)
+    
+    embed = discord.Embed(
+        title="📸 Spoiler Reaction Leaderboard (Top 10)",
+        color=discord.Color.purple()
+    )
+    
+    # ===== Top 10 User =====
     lines = []
-    for (user_id, emoji), count in counter.most_common(20):
+    for user_id, count in top10:
         member = interaction.guild.get_member(int(user_id))
         name = member.display_name if member else f"<User {user_id}>"
-        lines.append(f"{emoji} **{count}x** — {name}")
+        lines.append(f"**{count}x** — {name}")
+    
+    embed.description = "\n".join(lines)
+    
+    # ===== ACCUMULATED ROLE RANKING =====
+    config = load_reaction_config(guild_id)
+    rank_roles = config.get("rank_roles", [])
+    
+    if rank_roles:
+        # Lua Style Divider
+        embed.add_field(name="— — — — —", value=" ", inline=False)
+    
+        # (1) Count reactions per user
+        user_reaction_count = Counter()
+        for r in reactions:
+            user_reaction_count[r["user_id"]] += 1
+    
+        # (2) Prepare role totals
+        role_totals = {rid: 0 for rid in rank_roles}
+        
+        # (3) Add reactions per user to all roles they have
+        for user_id, count in user_reaction_count.items():
+            member = interaction.guild.get_member(int(user_id))
+            if not member:
+                continue
+            
+            for rid in rank_roles:
+                role = interaction.guild.get_role(int(rid))
+                if role and role in member.roles:
+                    role_totals[rid] += count
+        
+        # (4) Sort roles by total reactions
+        sorted_roles = sorted(
+        role_totals.items(),
+        key=lambda x: x[1],
+        reverse=True
+        )
+        
+        # (5) Show accumulated ranking
+        for rid, total in sorted_roles:
+            role = interaction.guild.get_role(int(rid))
+            if role is None:
+                continue
+    
+            embed.add_field(
+                name=f"🎭 {role.name}",
+                value=f"**{total} Reaktionen** insgesamt",
+                inline=False
+            )
 
-    embed = discord.Embed(title="📸 Spoiler Reaction Leaderboard",
-                          color=discord.Color.purple(),
-                          description="\n".join(lines))
     await interaction.response.send_message(embed=embed)
-
 
 @bot.tree.command(name="reaction_set_roles",
                   description="Setze Ranking-Rollen.")
@@ -598,9 +731,46 @@ async def reaction_set_roles(interaction: discord.Interaction,
         ephemeral=True)
 
 
+@bot.tree.command(name="reaction_reset",
+                  description="Löscht alle Reaction-Daten.")
+@app_commands.checks.has_permissions(administrator=True)
+async def reaction_reset(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    path = reaction_stats_path(guild_id)
+
+    if os.path.exists(path):
+        os.remove(path)
+
+    await interaction.response.send_message(
+        "🗑 Alle Reaction-Daten wurden gelöscht.", ephemeral=True)
+
+
+@bot.tree.command(name="reaction_cleanup",
+                  description="Alter Reaction-Einträge löschen")
+@app_commands.describe(days="Anzahl Tage (Standard: 30)")
+@app_commands.checks.has_permissions(administrator=True)
+async def reaction_cleanup(interaction: discord.Interaction, days: int = 30):
+    guild_id = str(interaction.guild.id)
+    stats = load_reaction_stats(guild_id)
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    before = len(stats["reactions"])
+    stats["reactions"] = [
+        r for r in stats["reactions"]
+        if datetime.fromisoformat(r["timestamp"]) >= cutoff
+    ]
+    after = len(stats["reactions"])
+
+    save_reaction_stats(guild_id, stats)
+
+    await interaction.response.send_message(
+        f"🧹 {before-after} Einträge gelöscht, {after} verbleiben.",
+        ephemeral=True)
+
+
 # ========== Run the Bot ==========
 
 if __name__ == "__main__":
     ensure_csv_exists()
-    ensure_reaction_csv_exists()
     bot.run(TOKEN)
