@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import csv
 import os
+import json
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 
@@ -563,6 +564,38 @@ async def spoilerstats(interaction: discord.Interaction):
                           color=discord.Color.purple(),
                           description="\n".join(lines))
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="reaction_set_roles",
+                  description="Setze Ranking-Rollen.")
+@app_commands.checks.has_permissions(administrator=True)
+async def reaction_set_roles(interaction: discord.Interaction,
+                             role1: discord.Role,
+                             role2: discord.Role | None = None,
+                             role3: discord.Role | None = None,
+                             role4: discord.Role | None = None,
+                             role5: discord.Role | None = None):
+    guild_id = str(interaction.guild.id)
+
+    roles = [r for r in [role1, role2, role3, role4, role5] if r is not None]
+
+    config_path = f"data/reactions/configs/{guild_id}.json"
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+    try:
+        config = json.load(open(config_path))
+    except:
+        config = {}
+
+    config["rank_roles"] = [str(r.id) for r in roles]
+
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=4)
+
+    return await interaction.response.send_message(
+        "Gespeicherte Ranking-Rollen:\n" +
+        "\n".join([f"• {r.mention}" for r in roles]),
+        ephemeral=True)
 
 
 # ========== Run the Bot ==========
