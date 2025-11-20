@@ -258,6 +258,7 @@ def reset_user_counts(guild_id, user_id):
 async def on_ready():
     """Called when the bot successfully connects to Discord."""
     ensure_csv_exists()
+    ensure_reaction_csv_exists()
     cleanup_old_entries()  # Clean up old entries on startup
     daily_cleanup.start()  # Start the daily cleanup task
     await bot.tree.sync()  # Sync slash commands with Discord
@@ -501,6 +502,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     """
     if user.bot:
         return
+    print(f"[SpoilerTracker] Reaction added: {reaction.emoji} by {user}")
     message = reaction.message
     guild = message.guild
     if guild is None:
@@ -567,4 +569,5 @@ async def spoilerstats(interaction: discord.Interaction):
 
 if __name__ == "__main__":
     ensure_csv_exists()
+    ensure_reaction_csv_exists()
     bot.run(TOKEN)
