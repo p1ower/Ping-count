@@ -14,6 +14,7 @@ import os
 import json
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
+from discord import File
 
 import matplotlib.pyplot as plt
 import io
@@ -172,7 +173,7 @@ async def build_role_ranking(guild, reaction_stats, reaction_config):
 def ensure_csv_exists():
     """Create the CSV file with headers if it doesn't exist."""
     print("Ensuring CSV exists...")
-    if not os.path.exists(CSV_PATH):
+    if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0:
         try:
             with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -237,35 +238,32 @@ def write_all_pings(rows):
 
 
 def cleanup_old_entries(days: int = CLEANUP_DAYS):
-    """
-    Remove entries older than the specified number of days from the CSV.
-    
-    Args:
-        days: Remove entries older than this many days (default: CLEANUP_DAYS)
-    """
     if not os.path.exists(CSV_PATH):
         return
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
-    kept_rows = []
+    kept = []
     removed = 0
 
-    # Read and filter entries
     with open(CSV_PATH, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
                 ts = datetime.fromisoformat(row["timestamp"])
                 if ts >= cutoff:
-                    kept_rows.append(row)
+                    kept.append(row)
                 else:
                     removed += 1
-            except Exception:
-                # Skip rows with malformed timestamps
+            except:
                 continue
 
-    # Write back the filtered entries
+    # 🚫 Wenn nichts gelöscht wurde: CSV NICHT anfassen
+    if removed == 0:
+        print("Cleanup: nichts zu löschen.")
+        return
+
+    # 🟢 Nur überschreiben, wenn nötig
     with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f,
                                 fieldnames=[
@@ -273,7 +271,7 @@ def cleanup_old_entries(days: int = CLEANUP_DAYS):
                                     "channel_id", "timestamp"
                                 ])
         writer.writeheader()
-        writer.writerows(kept_rows)
+        writer.writerows(kept)
 
     print(f"✓ Cleaned up {removed} old entries (> {days} days old)")
 
@@ -640,7 +638,7 @@ async def timeline(interaction: discord.Interaction,
     await interaction.response.defer()
 
     guild_id = interaction.guild.id
-    csv_file = f"ping_data_{guild_id}.csv"
+    csv_file = f"role_pings.csv"
 
     if not os.path.exists(csv_file):
         return await interaction.followup.send(
@@ -652,8 +650,10 @@ async def timeline(interaction: discord.Interaction,
 
     with open(csv_file, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        #print(f"Reading CSV {reader}...")
         for row in reader:
             # nur dieses Guild
+            #print(f"Reading row {row}...")
             if str(row["guild_id"]) != str(guild_id):
                 continue
 
@@ -664,6 +664,7 @@ async def timeline(interaction: discord.Interaction,
             ts = datetime.fromisoformat(row["timestamp"])
             day = ts.date()
             timestamps[day] += 1
+            #print(f"loop timestamps {timestamps}...")
 
     if not timestamps:
         return await interaction.followup.send(
@@ -689,8 +690,11 @@ async def timeline(interaction: discord.Interaction,
     plt.close()
 
     # --- Graph senden ---
-    file = File(buffer, filename="ping_timeline.png")
-    await interaction.followup.send(file=file)
+    try:
+        file = File(buffer, filename="ping_timeline.png")
+        await interaction.followup.send(file=file)
+    except Exception as e:
+        await interaction.followup.send(f"Fehler beim Senden des Graphen: {e}")
 
 
 # ========== Reaction Commands ==========
