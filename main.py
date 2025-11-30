@@ -18,6 +18,10 @@ from discord import File
 
 import matplotlib.pyplot as plt
 import io
+from utils.timestamped_print import TimestampedPrint
+
+# Logging aktivieren
+logger = TimestampedPrint(log_file="bot.log", color=True)
 
 # Configuration
 CLEANUP_DAYS = 30  # Remove entries older than this many days
@@ -255,7 +259,8 @@ def cleanup_old_entries(days: int = CLEANUP_DAYS):
                     kept.append(row)
                 else:
                     removed += 1
-            except:
+            except Exception as e:
+                print(f"Error parsing timestamp: {e}")
                 continue
 
     # 🚫 Wenn nichts gelöscht wurde: CSV NICHT anfassen
@@ -441,6 +446,7 @@ async def _show_role_counts(interaction: discord.Interaction,
         interaction: Discord interaction object
         role: The role to show statistics for
     """
+
     top_users = get_top_for_role(interaction.guild.id, role.id)
     if not top_users:
         await interaction.response.send_message(
@@ -502,7 +508,7 @@ async def leaderboard(interaction: discord.Interaction,
                               reverse=True)
 
         # Build embed with top roles
-        embed = discord.Embed(title=f"🌍 Server Leaderboard — All Roles",
+        embed = discord.Embed(title="🌍 Server Leaderboard — All Roles",
                               color=discord.Color.gold(),
                               description="")
 
@@ -634,11 +640,11 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 @app_commands.describe(
     role="Optional: Zeigt nur die Timeline für diese Rolle.")
 async def timeline(interaction: discord.Interaction,
-                   role: discord.Role = None):
+                   role: discord.Role | None = None):
     await interaction.response.defer()
 
     guild_id = interaction.guild.id
-    csv_file = f"role_pings.csv"
+    csv_file = "role_pings.csv"
 
     if not os.path.exists(csv_file):
         return await interaction.followup.send(
@@ -794,7 +800,8 @@ async def reaction_set_roles(interaction: discord.Interaction,
 
     try:
         config = json.load(open(config_path))
-    except:
+    except Exception as e:
+        print(f"Fehler beim Laden der Konfiguration: {e}")
         config = {}
 
     config["rank_roles"] = [str(r.id) for r in roles]
