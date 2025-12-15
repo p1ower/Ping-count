@@ -5,7 +5,7 @@ Tracks when users mention/ping roles and provides statistics.
 Uses CSV for data storage (no database required).
 Discord.py v2.3+
 """
-
+from collections import Counter
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -358,6 +358,30 @@ def reset_user_counts(guild_id, user_id):
     write_all_pings(new_rows)
 
 
+# ========== general message activity ==========
+
+
+def parse_ts(ts: str) -> datetime:
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def append_message_activity(guild_id, user_id, channel_id):
+    file_exists = os.path.isfile("activity_messages.csv")
+
+    with open("activity_messages.csv", "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        if not file_exists:
+            writer.writerow(["guild_id", "user_id", "channel_id", "timestamp"])
+
+        writer.writerow(
+            [guild_id, user_id, channel_id,
+             datetime.utcnow().isoformat()])
+
+
 # ========== Bot Events ==========
 
 
@@ -387,6 +411,9 @@ async def on_message(message: discord.Message):
     # Ignore messages from bots and DMs
     if message.author.bot or not message.guild:
         return
+
+    append_message_activity(message.guild.id, message.author.id,
+                            message.channel.id)
 
     # Check if any roles were mentioned
     for role in message.role_mentions:
@@ -567,6 +594,7 @@ async def mycounts(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@app_commands.checks.has_permissions(manage_guild=True)
 @bot.tree.command(name="resetcounts",
                   description="Reset all counts for a role (Admin only)")
 @app_commands.describe(role="Select a role to reset counts for")
@@ -587,6 +615,7 @@ async def resetmycounts(interaction: discord.Interaction):
                                             ephemeral=True)
 
 
+@app_commands.checks.has_permissions(manage_guild=True)
 @bot.tree.command(name="cleanup",
                   description="Clean up old ping records (Admin only)")
 @app_commands.describe(
@@ -637,6 +666,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 # ========== ping_timeline Commands ==========
 
 
+@app_commands.checks.has_permissions(manage_guild=True)
 @bot.tree.command(
     name="timeline",
     description="Zeigt einen Zeitverlaufsgraphen der Role-Pings.")
@@ -713,6 +743,7 @@ async def timeline(interaction: discord.Interaction,
 # ========== Reaction Commands ==========
 
 
+@app_commands.checks.has_permissions(manage_guild=True)
 @bot.tree.command(name="reactionstats",
                   description="Zeigt Reaction-Leaderboard")
 async def reactionstats(interaction: discord.Interaction):
@@ -848,13 +879,13 @@ async def reaction_cleanup(interaction: discord.Interaction, days: int = 30):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     before = len(stats["reactions"])
-    
+
     def parse_timestamp_aware(ts_str):
         ts = datetime.fromisoformat(ts_str)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         return ts
-    
+
     stats["reactions"] = [
         r for r in stats["reactions"]
         if parse_timestamp_aware(r["timestamp"]) >= cutoff
@@ -886,6 +917,703 @@ async def privacy(interaction: discord.Interaction):
         "Data is automatically cleaned after a configurable retention period (default: 30 days)."
     ),
                                             ephemeral=True)
+
+
+@bot.tree.command(name="activity_overview",
+                  description="Shows general server activity (admin only)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_overview(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    now = datetime.now(timezone.utc)
+
+    # Read the CSV data for messages and role pings
+    message_rows = []
+    role_ping_rows = []
+
+    # Read the message activity log
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            message_rows = [
+                row for row in reader if row["guild_id"] == guild_id
+            ]
+    except FileNotFoundError:
+        pass  # No data yet, that's fine.
+
+    # Read the role ping activity log
+    try:
+        with open("role_pings.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            role_ping_rows = [
+                row for row in reader if row["guild_id"] == guild_id
+            ]
+    except FileNotFoundError:
+        pass  # No data yet, that's fine.
+
+    # Calculate total messages in the last 7 and 30 days
+    def count_messages_in_period(rows, days):
+        cutoff = now - timedelta(days=days)
+        return sum(1 for row in rows if parse_ts(row["timestamp"]) >= cutoff)
+
+    total_messages_7d = count_messages_in_period(message_rows, 7)
+    total_messages_30d = count_messages_in_period(message_rows, 30)
+
+    # Calculate total role pings in the last 7 and 30 days
+    total_role_pings_7d = count_messages_in_period(role_ping_rows, 7)
+    total_role_pings_30d = count_messages_in_period(role_ping_rows, 30)
+
+    # Find the most active channel
+    channel_counter = Counter(row["channel_id"] for row in message_rows)
+    most_active_channel = channel_counter.most_common(1)
+
+    # Find the most active user
+    user_counter = Counter(row["user_id"] for row in message_rows)
+    most_active_user = user_counter.most_common(1)
+
+    # Calculate peak hours (last 7 days)
+    hour_counter = Counter(
+        parse_ts(row["timestamp"]).hour for row in message_rows
+        if parse_ts(row["timestamp"]) >= now - timedelta(days=7))
+    peak_hour = hour_counter.most_common(1)
+
+    # Prepare the embed response
+    embed = discord.Embed(title="📊 Server Activity Overview",
+                          color=discord.Color.blue())
+
+    embed.add_field(
+        name="📅 Total Messages",
+        value=
+        f"Last 7 days: **{total_messages_7d}**\nLast 30 days: **{total_messages_30d}**",
+        inline=False)
+    embed.add_field(
+        name="🔔 Total Role Pings",
+        value=
+        f"Last 7 days: **{total_role_pings_7d}**\nLast 30 days: **{total_role_pings_30d}**",
+        inline=False)
+
+    if most_active_channel:
+        channel_id = most_active_channel[0][0]
+        channel = interaction.guild.get_channel(int(channel_id))
+        embed.add_field(
+            name="📈 Most Active Channel",
+            value=
+            f"**#{channel.name}** with **{most_active_channel[0][1]}** messages",
+            inline=False)
+
+    if most_active_user:
+        user_id = most_active_user[0][0]
+        user = interaction.guild.get_member(int(user_id))
+        embed.add_field(
+            name="🏆 Most Active User",
+            value=
+            f"**{user.display_name if user else 'Unknown User'}** with **{most_active_user[0][1]}** messages",
+            inline=False)
+
+    if peak_hour:
+        embed.add_field(
+            name="⏰ Peak Hour",
+            value=
+            f"**{peak_hour[0][0]}:00** with **{peak_hour[0][1]}** messages",
+            inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="activity_hours",
+                  description="Show message activity per hour (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 7)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_hours(interaction: discord.Interaction, days: int = 7):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    rows = []
+
+    # Read CSV safely
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") == guild_id:
+                    rows.append(row)
+    except FileNotFoundError:
+        pass
+
+    if not rows:
+        await interaction.followup.send("ℹ No activity data available.",
+                                        ephemeral=True)
+        return
+
+    # Count per hour
+    hour_counter = Counter()
+
+    for row in rows:
+        ts = parse_ts(row["timestamp"])
+        if ts >= cutoff:
+            hour_counter[ts.hour] += 1
+
+    if not hour_counter:
+        await interaction.followup.send(
+            f"ℹ No activity in the last {days} days.", ephemeral=True)
+        return
+
+    # Build output
+    lines = []
+    for hour in range(24):
+        count = hour_counter.get(hour, 0)
+        bar = "█" * min(count // max(1, max(hour_counter.values()) // 10), 10)
+        lines.append(f"`{hour:02d}:00` | {count:5d} {bar}")
+
+    description = "\n".join(lines)
+
+    embed = discord.Embed(title="🕒 Activity by Hour (UTC)",
+                          description=description,
+                          color=discord.Color.green())
+    embed.set_footer(text=f"Last {days} days")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity_channels",
+                  description="Show most active channels (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 7)",
+                       limit="How many channels to show (default: 10)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_channels(interaction: discord.Interaction,
+                            days: int = 7,
+                            limit: int = 10):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    rows = []
+
+    # Read CSV
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") == guild_id:
+                    rows.append(row)
+    except FileNotFoundError:
+        pass
+
+    if not rows:
+        await interaction.followup.send("ℹ No activity data available.",
+                                        ephemeral=True)
+        return
+
+    # Count messages per channel
+    channel_counter = Counter()
+
+    for row in rows:
+        ts = parse_ts(row["timestamp"])
+        if ts >= cutoff:
+            channel_counter[row["channel_id"]] += 1
+
+    if not channel_counter:
+        await interaction.followup.send(
+            f"ℹ No activity in the last {days} days.", ephemeral=True)
+        return
+
+    # Build output
+    lines = []
+    for channel_id, count in channel_counter.most_common(limit):
+        channel = interaction.guild.get_channel(int(channel_id))
+        name = f"#{channel.name}" if channel else "*deleted-channel*"
+        lines.append(f"{name:<25} — **{count}** messages")
+
+    embed = discord.Embed(title="📊 Most Active Channels",
+                          description="\n".join(lines),
+                          color=discord.Color.blurple())
+    embed.set_footer(text=f"Last {days} days • Top {limit} channels")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity_channel_heatmap",
+                  description="Show activity heatmap per channel (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 7)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_channel_heatmap(interaction: discord.Interaction,
+                                   days: int = 7):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    rows: list[dict] = []
+
+    # -----------------------------
+    # Read CSV
+    # -----------------------------
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") == guild_id:
+                    rows.append(row)
+    except FileNotFoundError:
+        await interaction.followup.send("ℹ No activity data available.",
+                                        ephemeral=True)
+        return
+
+    if not rows:
+        await interaction.followup.send("ℹ No activity data available.",
+                                        ephemeral=True)
+        return
+
+    # -----------------------------
+    # Prepare activity container
+    # -----------------------------
+    channel_activity: dict[str, list[int]] = {
+        str(channel.id): [0] * 24
+        for channel in interaction.guild.text_channels
+    }
+
+    # -----------------------------
+    # Count messages
+    # -----------------------------
+    for row in rows:
+        try:
+            ts = parse_ts(row["timestamp"])  # MUST return UTC-aware datetime
+        except Exception:
+            continue
+
+        if ts < cutoff:
+            continue
+
+        channel_id = row.get("channel_id")
+        if channel_id not in channel_activity:
+            continue
+
+        channel_activity[channel_id][ts.hour] += 1
+
+    # -----------------------------
+    # Rank channels by activity
+    # -----------------------------
+    channel_totals = {
+        cid: sum(hours)
+        for cid, hours in channel_activity.items() if sum(hours) > 0
+    }
+
+    if not channel_totals:
+        await interaction.followup.send(
+            "ℹ No activity found for the selected time period.",
+            ephemeral=True)
+        return
+
+    top_channels = sorted(channel_totals.items(),
+                          key=lambda x: x[1],
+                          reverse=True)[:15]  # HARD LIMIT (embed-safe)
+
+    # -----------------------------
+    # Build heatmap
+    # -----------------------------
+    lines: list[str] = []
+
+    for channel_id, _total in top_channels:
+        channel = interaction.guild.get_channel(int(channel_id))
+        if not channel:
+            continue
+
+        activity = channel_activity[channel_id]
+        max_activity = max(activity)
+
+        if max_activity == 0:
+            continue
+
+        heatmap = ""
+        for count in activity:
+            ratio = count / max_activity
+            if ratio == 0:
+                heatmap += "░"
+            elif ratio < 0.33:
+                heatmap += "▒"
+            elif ratio < 0.66:
+                heatmap += "▓"
+            else:
+                heatmap += "█"
+
+        lines.append(f"**#{channel.name}**\n`{heatmap}`")
+
+    if not lines:
+        await interaction.followup.send(
+            "ℹ No activity found for the selected time period.",
+            ephemeral=True)
+        return
+
+    # -----------------------------
+    # Send embed
+    # -----------------------------
+    embed = discord.Embed(title="📊 Channel Activity Heatmap",
+                          description="\n\n".join(lines),
+                          color=discord.Color.blurple())
+
+    embed.add_field(name="Legend",
+                    value=("░ none · ▒ low · ▓ medium · █ high\n"
+                           "Left → right = 00:00 → 23:00 (UTC)"),
+                    inline=False)
+
+    embed.set_footer(
+        text=f"Last {days} days • Top {len(lines)} active channels")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity_user",
+                  description="Show most active users (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 7)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_user(interaction: discord.Interaction, days: int = 7):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    user_counter = Counter()
+
+    # Read CSV
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") != guild_id:
+                    continue
+
+                ts = parse_ts(row["timestamp"])
+                if ts >= cutoff:
+                    user_counter[row["user_id"]] += 1
+
+    except FileNotFoundError:
+        pass
+
+    if not user_counter:
+        await interaction.followup.send("ℹ No activity data available.",
+                                        ephemeral=True)
+        return
+
+    # Top 15 users (safe for embeds)
+    top_users = user_counter.most_common(15)
+
+    lines = []
+    for user_id, count in top_users:
+        member = interaction.guild.get_member(int(user_id))
+        name = member.display_name if member else f"User {user_id}"
+        lines.append(f"**{name}** — `{count}` messages")
+
+    embed = discord.Embed(title="👤 User Activity",
+                          description="\n".join(lines),
+                          color=discord.Color.blurple())
+
+    embed.set_footer(text=f"Last {days} days • Top {len(lines)} users")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity_user_distribution",
+                  description="Show activity distribution (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 30)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_user_distribution(interaction: discord.Interaction,
+                                     days: int = 30):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    user_counter = Counter()
+    total_messages = 0
+
+    # Read CSV
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") != guild_id:
+                    continue
+
+                ts = parse_ts(row["timestamp"])
+                if ts >= cutoff:
+                    user_counter[row["user_id"]] += 1
+                    total_messages += 1
+    except FileNotFoundError:
+        pass
+
+    if not user_counter:
+        await interaction.followup.send("ℹ No activity data available.",
+                                        ephemeral=True)
+        return
+
+    user_counts = sorted(user_counter.values(), reverse=True)
+    total_users = len(user_counts)
+
+    def pct(n: float) -> str:
+        return f"{n:.1f}%"
+
+    def share(top_percent: float) -> float:
+        cutoff_index = max(1, int(total_users * top_percent))
+        return sum(user_counts[:cutoff_index]) / total_messages * 100
+
+    top_10 = share(0.10)
+    top_25 = share(0.25)
+    top_50 = share(0.50)
+
+    embed = discord.Embed(title="📊 User Activity Distribution",
+                          color=discord.Color.blurple())
+
+    embed.add_field(name="Users",
+                    value=(f"Total active users: **{total_users}**\n"
+                           f"Total messages: **{total_messages}**"),
+                    inline=False)
+
+    embed.add_field(name="Message Share",
+                    value=(f"Top 10% → **{pct(top_10)}**\n"
+                           f"Top 25% → **{pct(top_25)}**\n"
+                           f"Top 50% → **{pct(top_50)}**"),
+                    inline=False)
+
+    embed.set_footer(text=f"Last {days} days")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="activity_user_role",
+    description="Show activity for users with a specific role (admin only)")
+@app_commands.describe(role="Role to analyze",
+                       days="How many days to analyze (default: 30)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_user_role(interaction: discord.Interaction,
+                             role: discord.Role,
+                             days: int = 30):
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    guild_id = str(guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    # Users that currently have the role
+    role_member_ids = {str(m.id) for m in role.members}
+    if not role_member_ids:
+        await interaction.followup.send(
+            f"ℹ No members currently have the role **{role.name}**.",
+            ephemeral=True)
+        return
+
+    user_counter = Counter()
+
+    # Read CSV
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") != guild_id:
+                    continue
+
+                if row["user_id"] not in role_member_ids:
+                    continue
+
+                ts = parse_ts(row["timestamp"])
+                if ts >= cutoff:
+                    user_counter[row["user_id"]] += 1
+    except FileNotFoundError:
+        pass
+
+    if not user_counter:
+        await interaction.followup.send(
+            "ℹ No activity recorded for this role.", ephemeral=True)
+        return
+
+    # Top 15 users
+    top_users = user_counter.most_common(15)
+
+    lines = []
+    for user_id, count in top_users:
+        member = guild.get_member(int(user_id))
+        name = member.display_name if member else f"User {user_id}"
+        lines.append(f"**{name}** — `{count}` messages")
+
+    embed = discord.Embed(
+        title=f"👥 Role Activity — {role.name}",
+        description="\n".join(lines),
+        color=role.color if role.color.value else discord.Color.blurple())
+
+    embed.set_footer(
+        text=f"Last {days} days • {len(role_member_ids)} members in role")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity_inactive",
+                  description="Show inactive users (admin only)")
+@app_commands.describe(days="Users inactive for this many days (default: 30)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_inactive(interaction: discord.Interaction, days: int = 30):
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    guild_id = str(guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    # Track last activity per user
+    last_seen: dict[str, datetime] = {}
+
+    # Read CSV
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") != guild_id:
+                    continue
+
+                ts = parse_ts(row["timestamp"])
+                user_id = row["user_id"]
+
+                if user_id not in last_seen or ts > last_seen[user_id]:
+                    last_seen[user_id] = ts
+    except FileNotFoundError:
+        pass
+
+    inactive_users = []
+
+    for member in guild.members:
+        if member.bot:
+            continue
+
+        uid = str(member.id)
+        last = last_seen.get(uid)
+
+        if last is None or last < cutoff:
+            inactive_users.append((member, last))
+
+    if not inactive_users:
+        await interaction.followup.send("ℹ No inactive users found.",
+                                        ephemeral=True)
+        return
+
+    # Sort by longest inactivity first
+    inactive_users.sort(
+        key=lambda x: x[1] or datetime.min.replace(tzinfo=timezone.utc))
+
+    lines = []
+    for member, last in inactive_users[:15]:
+        if last:
+            days_ago = (now - last).days
+            last_text = f"{days_ago} days ago"
+        else:
+            last_text = "never"
+
+        lines.append(f"**{member.display_name}** — last active: `{last_text}`")
+
+    embed = discord.Embed(title="😴 Inactive Users",
+                          description="\n".join(lines),
+                          color=discord.Color.orange())
+
+    embed.set_footer(
+        text=f"Inactive for ≥ {days} days • Showing top {len(lines)}")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="activity_user_ping_ratio",
+    description="Show ping vs message ratio per user (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 30)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_user_ping_ratio(interaction: discord.Interaction,
+                                   days: int = 30):
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    guild_id = str(guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    message_counter = Counter()
+    ping_counter = Counter()
+
+    # Read message activity
+    try:
+        with open("activity_messages.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") != guild_id:
+                    continue
+
+                ts = parse_ts(row["timestamp"])
+                if ts >= cutoff:
+                    message_counter[row["user_id"]] += 1
+    except FileNotFoundError:
+        pass
+
+    # Read role ping activity
+    try:
+        with open("role_pings.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("guild_id") != guild_id:
+                    continue
+
+                ts = parse_ts(row["timestamp"])
+                if ts >= cutoff:
+                    ping_counter[row["user_id"]] += 1
+    except FileNotFoundError:
+        pass
+
+    users = set(message_counter) | set(ping_counter)
+
+    if not users:
+        await interaction.followup.send("ℹ No activity data available.",
+                                        ephemeral=True)
+        return
+
+    rows = []
+    for uid in users:
+        msgs = message_counter.get(uid, 0)
+        pings = ping_counter.get(uid, 0)
+        total = msgs + pings
+        if total == 0:
+            continue
+
+        ratio = pings / total
+        rows.append((uid, msgs, pings, ratio))
+
+    # Sort by highest ping ratio first
+    rows.sort(key=lambda x: x[3], reverse=True)
+
+    lines = []
+    for uid, msgs, pings, ratio in rows[:15]:
+        member = guild.get_member(int(uid))
+        name = member.display_name if member else f"User {uid}"
+
+        lines.append(f"**{name}** — "
+                     f"💬 `{msgs}` | 🔔 `{pings}` | "
+                     f"ratio `{ratio:.0%}`")
+
+    embed = discord.Embed(title="🔔 Ping vs Message Ratio",
+                          description="\n".join(lines),
+                          color=discord.Color.red())
+
+    embed.add_field(name="Interpretation",
+                    value=("• `0–20%` healthy\n"
+                           "• `20–50%` watch\n"
+                           "• `>50%` potential abuse"),
+                    inline=False)
+
+    embed.set_footer(text=f"Last {days} days • Top {len(lines)} users")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ========== Run the Bot ==========
