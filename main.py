@@ -255,6 +255,9 @@ def cleanup_old_entries(days: int = CLEANUP_DAYS):
         for row in reader:
             try:
                 ts = datetime.fromisoformat(row["timestamp"])
+                # Handle naive timestamps (old data) by assuming UTC
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
                 if ts >= cutoff:
                     kept.append(row)
                 else:
