@@ -645,6 +645,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 async def timeline(interaction: discord.Interaction,
                    role: discord.Role | None = None):
     await interaction.response.defer()
+    print(f"Generating timeline for {role.name if role else 'all roles'}...")
 
     guild_id = interaction.guild.id
     csv_file = "role_pings.csv"
@@ -671,6 +672,9 @@ async def timeline(interaction: discord.Interaction,
                 continue
 
             ts = datetime.fromisoformat(row["timestamp"])
+            # Handle naive timestamps (old data) by assuming UTC
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
             day = ts.date()
             timestamps[day] += 1
             #print(f"loop timestamps {timestamps}...")
@@ -712,6 +716,7 @@ async def timeline(interaction: discord.Interaction,
 @bot.tree.command(name="reactionstats",
                   description="Zeigt Reaction-Leaderboard")
 async def reactionstats(interaction: discord.Interaction):
+    print(f"Generating reaction stats for {interaction.guild.name}...")
     guild_id = str(interaction.guild.id)
 
     stats = load_reaction_stats(guild_id)
@@ -843,9 +848,16 @@ async def reaction_cleanup(interaction: discord.Interaction, days: int = 30):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     before = len(stats["reactions"])
+    
+    def parse_timestamp_aware(ts_str):
+        ts = datetime.fromisoformat(ts_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    
     stats["reactions"] = [
         r for r in stats["reactions"]
-        if datetime.fromisoformat(r["timestamp"]) >= cutoff
+        if parse_timestamp_aware(r["timestamp"]) >= cutoff
     ]
     after = len(stats["reactions"])
 
