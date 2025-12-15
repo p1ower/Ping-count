@@ -463,7 +463,7 @@ async def _show_role_counts(interaction: discord.Interaction,
     embed = discord.Embed(title=f"🏆 Top Role Pingers — {role.name}",
                           color=discord.Color.blurple())
     embed.description = "\n".join(lines)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="rolecounts",
@@ -534,7 +534,7 @@ async def leaderboard(interaction: discord.Interaction,
                 value="\n".join(user_lines),
                 inline=False)
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
         # Show leaderboard for specific role
         await _show_role_counts(interaction, role)
@@ -779,7 +779,7 @@ async def reactionstats(interaction: discord.Interaction):
                             value=f"**{total} Reaktionen** insgesamt",
                             inline=False)
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="reaction_set_roles",
@@ -851,6 +851,26 @@ async def reaction_cleanup(interaction: discord.Interaction, days: int = 30):
     await interaction.response.send_message(
         f"🧹 {before-after} Einträge gelöscht, {after} verbleiben.",
         ephemeral=True)
+
+
+@bot.tree.command(name="privacy",
+                  description="Information about data collection and privacy")
+async def privacy(interaction: discord.Interaction):
+    await interaction.response.send_message((
+        "🔒 **Privacy & Data Usage**\n\n"
+        "This bot collects **server activity metadata** for moderation and analytics purposes.\n\n"
+        "**What is collected:**\n"
+        "• User IDs\n"
+        "• Channel IDs\n"
+        "• Role mentions (pingable roles only)\n"
+        "• Timestamps\n\n"
+        "**What is NOT collected:**\n"
+        "• Message content\n"
+        "• Private messages (DMs)\n"
+        "• Attachments\n\n"
+        "Data is automatically cleaned after a configurable retention period (default: 30 days)."
+    ),
+                                            ephemeral=True)
 
 
 # ========== Run the Bot ==========
