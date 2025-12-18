@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import io
 from utils.timestamped_print import TimestampedPrint
 
+vc_sessions: dict[tuple[str, str], dict] = {}
+
 # Logging aktivieren
 logger = TimestampedPrint(log_file="bot.log", color=True)
 
@@ -382,6 +384,17 @@ def append_message_activity(guild_id, user_id, channel_id):
              datetime.utcnow().isoformat()])
 
 
+def ensure_voice_csv():
+    if not os.path.exists("activity_voice.csv"):
+        with open("activity_voice.csv", "w", encoding="utf-8",
+                  newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "guild_id", "user_id", "channel_id", "joined_at", "left_at",
+                "duration_seconds"
+            ])
+
+
 # ========== Bot Events ==========
 
 
@@ -456,30 +469,41 @@ async def on_voice_state_update(member, before, after):
 
     guild_id = str(member.guild.id)
     user_id = str(member.id)
+    key = (guild_id, user_id)
 
     now = datetime.now(timezone.utc)
 
-    # Joined a VC
+    # JOIN VC
     if before.channel is None and after.channel is not None:
-        member._vc_join_time = now
-        member._vc_channel_id = str(after.channel.id)
+        vc_sessions[key] = {
+            "joined_at": now,
+            "channel_id": str(after.channel.id)
+        }
+        return
 
-    # Left a VC
-    elif before.channel is not None and after.channel is None:
-        joined = getattr(member, "_vc_join_time", None)
-        channel_id = getattr(member, "_vc_channel_id", None)
+    # LEAVE VC
+    if before.channel is not None and after.channel is None:
+        session = vc_sessions.pop(key, None)
+        if not session:
+            return
 
-        if joined and channel_id:
-            duration = int((now - joined).total_seconds())
+        joined = session["joined_at"]
+        channel_id = session["channel_id"]
+        duration = int((now - joined).total_seconds())
 
-            with open("activity_voice.csv", "a", encoding="utf-8",
-                      newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    guild_id, user_id, channel_id,
-                    joined.isoformat(),
-                    now.isoformat(), duration
-                ])
+        if duration <= 0:
+            return
+
+        ensure_voice_csv()
+
+        with open("activity_voice.csv", "a", encoding="utf-8",
+                  newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                guild_id, user_id, channel_id,
+                joined.isoformat(),
+                now.isoformat(), duration
+            ])
 
 
 # ========== Slash Commands ==========
@@ -1704,6 +1728,204 @@ async def activity_vc_overview(interaction: discord.Interaction,
                     value=f"{hours}h {minutes}m",
                     inline=False)
 
+    embed.set_footer(text=f"Last {days} days")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity_vc_users",
+                  description="Show most active voice users (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 7)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_vc_users(interaction: discord.Interaction, days: int = 7):
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    guild_id = str(guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    user_seconds = Counter()
+    user_sessions = Counter()
+
+    try:
+        with open("activity_voice.csv", "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                g_id, user_id, _channel_id, joined_at, _left_at, duration = row
+                if g_id != guild_id:
+                    continue
+
+                joined = parse_ts(joined_at)
+                if joined >= cutoff:
+                    secs = int(duration)
+                    user_seconds[user_id] += secs
+                    user_sessions[user_id] += 1
+    except FileNotFoundError:
+        pass
+
+    if not user_seconds:
+        await interaction.followup.send("ℹ No voice activity recorded.",
+                                        ephemeral=True)
+        return
+
+    # Top 15 users by total time
+    top_users = user_seconds.most_common(15)
+
+    lines = []
+    for user_id, total_secs in top_users:
+        member = guild.get_member(int(user_id))
+        name = member.display_name if member else f"User {user_id}"
+
+        hours = total_secs // 3600
+        minutes = (total_secs % 3600) // 60
+        sessions = user_sessions[user_id]
+
+        lines.append(f"**{name}** — "
+                     f"⏱ `{hours}h {minutes}m` · "
+                     f"🎧 `{sessions}` sessions")
+
+    embed = discord.Embed(title="🎙 Voice Activity — Users",
+                          description="\n".join(lines),
+                          color=discord.Color.green())
+
+    embed.set_footer(text=f"Last {days} days • Top {len(lines)} users")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity_vc_hours",
+                  description="Show VC activity by hour (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 7)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_vc_hours(interaction: discord.Interaction, days: int = 7):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    hour_seconds = [0] * 24
+
+    try:
+        with open("activity_voice.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                if row["guild_id"] != guild_id:
+                    continue
+
+                joined = parse_ts(row["joined_at"])
+                left = parse_ts(row["left_at"])
+
+                if left < cutoff:
+                    continue
+
+                start = max(joined, cutoff)
+                current = start
+
+                while current < left:
+                    next_hour = (current + timedelta(hours=1)).replace(
+                        minute=0, second=0, microsecond=0)
+                    segment_end = min(next_hour, left)
+                    seconds = int((segment_end - current).total_seconds())
+
+                    hour_seconds[current.hour] += seconds
+                    current = segment_end
+
+    except FileNotFoundError:
+        await interaction.followup.send("ℹ No VC activity data available.",
+                                        ephemeral=True)
+        return
+
+    if not any(hour_seconds):
+        await interaction.followup.send(
+            "ℹ No VC activity found in this period.", ephemeral=True)
+        return
+
+    max_seconds = max(hour_seconds)
+
+    lines = []
+    for hour, seconds in enumerate(hour_seconds):
+        blocks = int((seconds / max_seconds) * 10) if max_seconds else 0
+        bar = "█" * blocks + "░" * (10 - blocks)
+        minutes = seconds // 60
+        lines.append(f"`{hour:02d}:00` {bar}  {minutes} min")
+
+    embed = discord.Embed(title="🎧 Voice Activity by Hour",
+                          description="\n".join(lines),
+                          color=discord.Color.green())
+    embed.set_footer(text=f"Last {days} days")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity_vc_channels",
+                  description="Show VC activity by channel (admin only)")
+@app_commands.describe(days="How many days to analyze (default: 7)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def activity_vc_channels(interaction: discord.Interaction,
+                               days: int = 7):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild.id)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    channel_seconds: dict[str, int] = {}
+
+    try:
+        with open("activity_voice.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                if row["guild_id"] != guild_id:
+                    continue
+
+                joined = parse_ts(row["joined_at"])
+                left = parse_ts(row["left_at"])
+
+                if left < cutoff:
+                    continue
+
+                start = max(joined, cutoff)
+                seconds = int((left - start).total_seconds())
+
+                if seconds <= 0:
+                    continue
+
+                channel_id = row["channel_id"]
+                channel_seconds[channel_id] = (
+                    channel_seconds.get(channel_id, 0) + seconds)
+
+    except FileNotFoundError:
+        await interaction.followup.send("ℹ No VC activity data available.",
+                                        ephemeral=True)
+        return
+
+    if not channel_seconds:
+        await interaction.followup.send(
+            "ℹ No VC activity found in this period.", ephemeral=True)
+        return
+
+    # Sort channels by activity
+    top_channels = sorted(channel_seconds.items(),
+                          key=lambda x: x[1],
+                          reverse=True)[:10]
+
+    lines = []
+    for i, (channel_id, seconds) in enumerate(top_channels, start=1):
+        channel = interaction.guild.get_channel(int(channel_id))
+        name = channel.name if channel else f"Unknown ({channel_id})"
+
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+
+        lines.append(f"**{i}. {name}** — {hours}h {minutes}m")
+
+    embed = discord.Embed(title="🎙 Voice Activity by Channel",
+                          description="\n".join(lines),
+                          color=discord.Color.orange())
     embed.set_footer(text=f"Last {days} days")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
