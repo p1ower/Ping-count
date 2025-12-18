@@ -1921,7 +1921,8 @@ async def activity_vc_channels(interaction: discord.Interaction,
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
 
-        lines.append(f"**{i}. {name}** — {hours}h {minutes}m")
+        lines.append(
+            f"**{i}. {name}** — {hours}h {minutes}m - *({channel_id})*")
 
     embed = discord.Embed(title="🎙 Voice Activity by Channel",
                           description="\n".join(lines),
